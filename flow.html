@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>STRYKE — end-to-end flow as built (2026-09-18)</title>
+<style>
+:root{--bg:#0b0f13;--card:#141a20;--ink:#f3f1eb;--muted:#b3bcc4;--dim:#808c94;--line:rgba(255,255,255,.1);--lime:#8baec5;--red:#ff5a4a;--green:#3dc257;--blue:#5b6bff}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.55 -apple-system,Inter,Segoe UI,sans-serif}
+main{max-width:1100px;margin:auto;padding:28px 20px 60px}h1{font-size:28px;margin:0 0 4px;letter-spacing:1px}h2{font-size:20px;margin:40px 0 12px;color:var(--lime);text-transform:uppercase;letter-spacing:1px}
+h3{font-size:16px;margin:22px 0 8px}p{color:var(--muted);max-width:860px}code{font:13px ui-monospace,Menlo,monospace;background:#1c242c;padding:1px 5px;border-radius:4px;color:var(--ink)}
+table{border-collapse:collapse;width:100%;margin:10px 0 18px;font-size:14px}th,td{text-align:left;vertical-align:top;padding:8px 10px;border-bottom:1px solid var(--line)}th{color:var(--dim);font-weight:600;font-size:12px;text-transform:uppercase;letter-spacing:.5px}
+.flow{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px;margin:14px 0 6px}.stage{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:14px}.stage b{display:block;font-size:15px;margin-bottom:4px}.stage span{color:var(--dim);font-size:12px}.stage .where{margin-top:8px;font-size:12px;color:var(--muted)}
+.tag{display:inline-block;padding:2px 8px;border-radius:4px;font-size:11px;letter-spacing:.5px;text-transform:uppercase;border:1px solid var(--line);color:var(--dim)}.ok{color:var(--green);border-color:var(--green)}.no{color:var(--red);border-color:var(--red)}.warn{color:#f2c14e;border-color:#f2c14e}
+.note{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:12px 16px;margin:12px 0;color:var(--muted)}
+ul{color:var(--muted)}li{margin:4px 0}
+</style></head><body><main>
+<h1>STRYKE — the flow, as built</h1>
+<p>Recording → shot cut → upload → ball solve → result on the phone, plus the optional hero and body-mesh stages. Written 2026-09-18 from the code on branch <code>vxbrandon/dev-2026-09-17-2</code>, not from the 28 August specs (those describe a larger system that was not built this way; see the last section). Every stage names the file that owns it.</p>
+
+<h2>1. One shot, end to end</h2>
+<div class="flow">
+<div class="stage"><b>① Record</b><span>iPhone, native Swift</span><div class="where">AVFoundation session at 1080p60, rolling ring of 8 s segments (5 kept), locked exposure, 1 ms shutter cap.<br><code>modules/stryke-capture/ios/CaptureController.swift</code>, <code>SegmentRing.swift</code>, <code>CaptureTuning.swift</code></div></div>
+<div class="stage"><b>② Detect the kick</b><span>audio impulse only</span><div class="where">Short-term energy on the mic: onset when one 1024-sample hop jumps &gt; 6× the rolling median and clears −40 dBFS; 800 ms refractory. Confidence capped at 0.85. Nothing visual confirms it, so claps and net hits also trigger. Manual fallback: the 짧은 클립 저장 button.<br><code>ShotDetector.swift</code></div></div>
+<div class="stage"><b>③ Cut the clip</b><span>no re-encode</span><div class="where">Passthrough cut of [T−1.0 s, T+2.5 s] from the ring on 0.5 s IDR boundaries → <code>shot_&lt;n&gt;_&lt;UUID&gt;.mov</code> in Application Support, plus a sidecar JSON (focal length, per-frame PTS, gravity/attitude track, device record).<br><code>ClipCutter.swift</code>, <code>ClipSidecar.swift</code>, <code>SidecarTracks.swift</code></div></div>
+<div class="stage"><b>④ Save locally</b><span>SQLite on the phone</span><div class="where">Shot row inserted before any network call; the Stop button never waits on the server.<br><code>src/features/training/real-pipeline.ts</code>, <code>store-core.ts</code>, <code>db/schema.ts</code></div></div>
+<div class="stage"><b>⑤ Upload</b><span>one multipart POST</span><div class="where">Register session → <code>POST /v1/training/sessions/{id}/shots</code> with the clip as form field <code>clip</code> (expo-file-system native task, byte progress since 2026-09-18) → <code>POST /v1/analysis/jobs</code> → complete session. The sidecar is <em>not</em> uploaded. Automatic sweeps re-register but never spend data; clips move only on 지금 보내기 (5 per tap).<br><code>real-pipeline.ts</code>, <code>api.ts</code>, <code>sweep.ts</code>, <code>api/client.ts</code></div></div>
+<div class="stage"><b>⑥ Job</b><span>be-api, FastAPI</span><div class="where">Job row (state, attempt, failure_class, refusal_reasons). Dispatched in-process to the vision service; the app polls <code>GET /v1/analysis/jobs/{id}</code>.<br><code>apps/be-api/…/analysis/service.py</code>, <code>ports/vision.py</code></div></div>
+<div class="stage"><b>⑦ Ball solve</b><span>be-vision → stryke-pipeline</span><div class="where">The worker on :8015 runs <code>pipeline.ball.analyze_video</code> in-process. Two entry strategies, then a ballistic fit with drag and Magnus, then a band.<br><code>apps/be-vision/…/ball_lane.py</code> → <code>stryke-pipeline/pipeline/ball.py</code></div></div>
+<div class="stage"><b>⑧ Result</b><span>band, placement, arc</span><div class="where">be-api turns the flight into a speed <em>band</em> (never a point unless ≥ 20 detections and every claim gate passes), a goal-mouth cell, and a trajectory table. The phone shows the band, the cell, the arc.<br><code>core/ball_result.py</code>, <code>core/confidence.py</code>, <code>core/placement.py</code>, <code>core/trajectory.py</code></div></div>
+<div class="stage"><b>⑨ Hero (automatic)</b><span>after every solved flight</span><div class="where">Offline render of the real trajectory with a <em>generic</em> CC0 body — not the user's mesh.<br><code>hero_lane.py</code> → <code>pipeline/heroshot.py</code></div></div>
+<div class="stage"><b>⑩ Body mesh (on demand)</b><span>user presses 메시</span><div class="where">Starts a GPU EC2 box, uploads the clip and <code>mesh_run.py</code>, runs GVHMR, exports a body sequence. Subject = the person who <em>moves</em> like a kicker (since 2026-09-18; it was the longest track, which picked bystanders).<br><code>mesh_lane.py</code>, <code>gpu_box.py</code>, <code>remote/mesh_run.py</code></div></div>
+</div>
+
+<h2>2. Inside the ball solve (stage ⑦)</h2>
+<p>This is the part that refused all four field clips. <code>ball.py</code> is 6,500 lines; the order it tries things is what matters.</p>
+<table><tr><th>Sub-stage</th><th>What it does</th><th>Refuses with</th></tr>
+<tr><td>Read + stabilise</td><td>Decodes frames, flags duplicated frames (variable-rate phones), estimates camera shake and compensates.</td><td><code>timebase_untrusted</code>, <code>retimed_suspected</code> (duplicate ratio ≥ 0.5)</td></tr>
+<tr><td>Entry A — rest ball</td><td>Finds a stationary white circle (Hough) that later <em>departs</em>; seeds the track from it.</td><td><code>rest_ball_not_located</code>, <code>rest_ball_no_departing_track</code></td></tr>
+<tr><td>Entry B — moving ball</td><td>Only if A refuses. Blob tracklets → strike candidates (slow then fast) → re-track with the fused ensemble → must be ballistic in pixels, radius-consistent, ≥ 12 post-contact detections, and prove it is a <em>ball</em> (white disc confirmed in both halves of the flight).</td><td><code>moving_ball_no_strike_detected</code>, <code>…flight_not_ballistic</code>, <code>…insufficient_ball_identity_evidence</code></td></tr>
+<tr><td>Track</td><td>Frame-differenced blobs + Hough locks, DET_CONF ≥ 0.3, ≤ 6 consecutive misses, min radius 3 px.</td><td>&lt; 8 detections → <code>too_few_detections</code> (the field clips)</td></tr>
+<tr><td>Fit</td><td>Nine-parameter ballistic fit (launch speed, elevation, azimuth ±60°, g_eff, two Magnus terms, camera height/tilt, launch instant), Reynolds-dependent drag, basin search over camera geometry.</td><td>rms &gt; 30 px, ≥ 3 parameters on a bound (<code>solver_railed</code>), anchor disagreement &gt; 35 %</td></tr>
+<tr><td>Scale</td><td>Metres come from the ball diameter and, when the goal is detected, the goal width. Sidecar focal length replaces the diagonal heuristic when present (it is not uploaded today).</td><td>8–19 detections → band only, no point speed</td></tr>
+</table>
+<div class="note">What the field clips hit: phone ~30 m back at night, ball &lt; 10 px, teammate 3 m from the lens, two other balls on the pitch. Entry A found 2–4 white circles and none departed; Entry B found a moving candidate that could not be confirmed as a ball. Correct refusal. Report with frames: <code>docs/reports/2026-09-18-field-clips/</code>.</div>
+
+<h2>3. What the phone can show (states and refusals)</h2>
+<table><tr><th>Shot status</th><th>Meaning</th></tr>
+<tr><td><code>pending_upload</code> → <code>uploading</code> → <code>uploaded</code> → <code>queued</code> → <code>analysing</code></td><td>The clip's journey. Drawn as 업로드 대기 / 확인 중.</td></tr>
+<tr><td><code>ready</code></td><td>A band exists. Point speed only when <code>claim_point_speed</code> is true (≥ 20 detections and no forcing reason).</td></tr>
+<tr><td><code>refused</code></td><td>The pipeline looked and declined. Reason shown with a fix line from <code>copy.ts refusalReasons</code>.</td></tr>
+<tr><td><code>failed</code></td><td>Infrastructure, not measurement (upload rejected, job crashed). Retryable.</td></tr></table>
+<p>Refusal reasons the backend can actually emit today: <span class="tag ok">too_few_detections</span> <span class="tag ok">low_speed_confidence</span> <span class="tag ok">retimed_suspected</span> <span class="tag ok">timebase_untrusted</span> <span class="tag ok">solver_railed</span>. Defined in the contract and translated in the app but <em>never produced</em>: <span class="tag no">no_metric_reference</span> <span class="tag no">contact_occluded</span> <span class="tag no">contact_disagreed</span> <span class="tag no">ball_too_small</span> <span class="tag no">camera_motion_exceeds_tolerance</span> <span class="tag no">no_kicker_detected</span> <span class="tag no">kicker_not_fully_in_frame</span> <span class="tag no">multiple_balls</span>. Mesh and hero have their own state machines (<code>MeshState</code>/<code>MeshReason</code>, <code>HeroState</code>/<code>HeroReason</code> in <code>contracts/…/vision.py</code>).</p>
+
+<h2>4. Where things run</h2>
+<table><tr><th>Process</th><th>Where</th><th>Started by</th></tr>
+<tr><td>API</td><td><code>:8000</code>, bound to all interfaces; the phone reaches it at <code>100.87.207.116</code> over Tailscale (ATS exception in <code>app.json</code>)</td><td><code>make field-api</code> (real vision) or <code>make dev</code> (fake vision)</td></tr>
+<tr><td>Postgres</td><td>Homebrew on <code>:5432</code> via <code>apps/be-api/.env.local</code> (compose on <code>:5433</code> is the default if that file is absent)</td><td><code>brew services</code> / <code>make db-up</code></td></tr>
+<tr><td>Vision worker</td><td><code>:8015</code>, CPU, imports <code>stryke-pipeline</code> from <code>~/Desktop/programming/stryke-pipeline</code></td><td><code>make field-vision</code></td></tr>
+<tr><td>GPU box</td><td>EC2, started per 메시 press, stopped when idle</td><td><code>mesh_lane.py</code></td></tr>
+<tr><td>Phone build</td><td><code>APP_VARIANT</code> picks the bundle id; the field profile installs <code>com.stryke.app.preview</code></td><td><code>docs/RELEASE.md</code></td></tr></table>
+
+<h2>5. What is not built (the specs say it is)</h2>
+<ul>
+<li>No visual confirmation of the kick, no fusion with audio, no speed-of-sound correction. <span class="tag no">02 §3.1</span></li>
+<li>No capture-time distance or framing check: goal and body detectors are compiled off; only the tilt chip is live. A player at 30 m gets a green chip. <span class="tag no">02 §2.4, 03 §5</span></li>
+<li>No shot segmentation inside a clip: one clip is one shot. <span class="tag no">03 §1.3 S1</span></li>
+<li>No pose lane, no contact-from-kinematics, no Verified/Quick calibration backend, no field profiles. <span class="tag no">03 §1.3 S3–S6, §3–§4</span></li>
+<li>No TUS/chunked/background upload; no SSE; no job reaper or retry budget. <span class="tag no">02 §6, 04 §7</span></li>
+<li>The sidecar is written but never uploaded, so the solver still guesses the focal length. <span class="tag warn">SIDECAR-CONTRACT §7</span></li>
+<li>Rankings serve only seeded test accounts; the route the spec forbade is the one that exists. <span class="tag warn">04 §8.8</span></li>
+</ul>
+<h3>Which older documents to trust</h3>
+<table><tr><th>Read</th><th>Ignore for the flow</th></tr>
+<tr><td><code>modules/stryke-capture/README.md</code>, <code>stryke-pipeline/SIDECAR-CONTRACT.md</code>, <code>docs/FIELD-CAPTURE-FLOW-2026-09-16.md</code>, <code>docs/FIELD.md</code> (ports and targets only), <code>docs/reports/</code></td><td><code>specs/stryke-v1/02–05</code>, <code>docs/stryke-design.html</code>, <code>docs/index.html</code>, <code>stryke-pipeline/docs/BALL.md</code> for the moving-ball path</td></tr></table>
+<p style="margin-top:36px;font-size:12px;color:var(--dim)">Sources: the four audits of 2026-09-18 against the code; <code>docs/reports/2026-09-18-field-clips/README.md</code>. Re-run those audits before trusting this page after the next capture or pipeline change.</p>
+</main></body></html>
